@@ -1,0 +1,197 @@
+
+##### Torch #####
+
+def __torch_batch(output, input, H, batch_size):
+    # Helper method to prepare and batch the data for PyTorch
+    '''
+    Parameters---
+        output : L x N (L is number of time points and N the features)
+        input : L x M (L is number of time points and M the number of inputs)
+        H : horizon, or number of steps, for the model to compute recursively, does not do well beyond 1
+        batch_size : Number of randomly selected data points per batch
+    Returns---
+        batched_data : data organized into batches to be used in training loop
+    '''
+    Y = torch.tensor(output.astype('float32'))                                  # Observation data
+    U = torch.tensor(input.astype('float32'))                                   # Control input data
+
+    class Data(torch.utils.data.Dataset):
+        def __init__(self, Y, U, H):
+            self.Y = Y                                                          # Observation data
+            self.U = U                                                          # Control input data
+            self.H = H                                                          # Number of points to compute loss over
+        
+        def __len__(self):
+            return len(self.Y)-self.H                                           # Length of array of valid points to pick
+        
+        def __getitem__(self, idx):
+            return (self.Y[idx:idx+self.H+1,:], self.U[idx:idx+self.H])         # Data at a point 'idx' + H-many more points
+
+    training_data = Data(Y,U,H)
+    batched_data = torch.utils.data.DataLoader(training_data,batch_size=batch_size,shuffle=True,drop_last=True)
+    return batched_data
+
+
+def __torch_model(x_dim, output_dim, input_dim):
+    # Helper method to prepare the PyTorch fitting model
+    '''
+    Parameters---
+        x_dim : Dimension of the latent state
+        output_dim : Dimension of the observation data (N)
+        input_dim : Dimension of the control input (M)
+    Returns---
+        model : the PyTorch model used to model the forward dynamic step
+    '''
+    class LinearDynamics(torch.nn.Module):
+        def __init__(self,ltnt,inp,obs):
+            super().__init__()
+            self.ltnt = ltnt                                                    # Dimension of latent state
+            self.inp = inp                                                      # Dimension of control input
+            self.obs = obs                                                      # Dimension of observation data
+
+            self.A = torch.nn.Linear(self.ltnt,self.ltnt,bias=False)            # State dynamics matrix as Linear layer
+            self.B = torch.nn.Linear(self.inp,self.ltnt,bias=False)             # Control matrix as Linear layer
+            self.K = torch.nn.Linear(self.obs,self.ltnt,bias=False)             # Obs-to-next-state matrix as Linear
+            self.C = torch.nn.Linear(self.ltnt,self.obs,bias=False)             # State-to-observation matrix as Linear
+
+        def forward(self, x, u, y):                                             # Function defining model inputs and outputs
+            x_next = self.A(x) + self.B(u) + self.K(y)                          # Latent state at time t+1
+            y_next = self.C(x_next)                                             # Predicted observation at time t+1
+            return x_next, y_next
+        
+    model = LinearDynamics(x_dim, input_dim, output_dim)
+    return model
+
+
+def fit_lds_pytorch(output, input, x_dim=None, H=1, batch_size=64, num_epochs=10,
+                    lr=5e-3, wd=1e-5):
+    # Fit a Linear Dynamical System with latent states using PyTorch
+    '''
+    Parameters---
+        output : L x N (L is number of time points and N the features)
+        input : L x M (L is number of time points and M the number of inputs)
+        x_dim : Integer corresponding to number of latent features, defaults to N
+        H : horizon, or number of steps, for the model to compute recursively, does not do well beyond 1
+        batch_size : Number of randomly selected data points per batch
+        num_epochs : Number of times to train over all the batches (relatively lower number when batching)
+        lr : learning rate parameter
+        wd : weight decay parameter
+    Returns---
+        model : PyTorch fitted latent dynamics model
+        losses : Losses per epoch
+    '''
+    if x_dim==None:                                                             # Set the dimension of the latent space
+        x_dim = output.shape[1]                                                 # Defaults to same as observation (less useful)
+    batched_data = __torch_batch(output, input, H, batch_size)                  # Data sampled into batches
+    model = __torch_model(x_dim, output.shape[1], input.shape[1])               # Dynamics model
+    loss_fn = torch.nn.MSELoss()                                                # Loss function as Mean Squared Error
+    optimizer = torch.optim.Adam(model.parameters(),lr=lr,weight_decay=wd)      # Adam optimizer
+
+    from tqdm.notebook import tnrange
+    prog_bar = tnrange(num_epochs)                                              # Set up a progress bar
+    losses = []                                                                 # Array to save the loss values in
+
+    model.train()
+    for e, epoch in enumerate(prog_bar):                                        # Iterate over the epochs
+        step_losses = []                                                        # Save loss in the substeps (batches)
+        for i, batch in enumerate(batched_data):
+            y, u = batch                                                        # Obtain a batch of data, each with H next steps
+            optimizer.zero_grad()                                               # Reset the optimizer
+            loss = 0                                
+            for t in range(H):                                                  # For each of the next steps
+                if t == 0:                                                      # For the first step do:
+                    xt = torch.tensor(np.zeros((batch_size, x_dim)).astype('float32'))  # Assume the latent state is zero
+                    yt = y[:,t]                                                 # Set the y(0) as the true observation 
+                xt, yt = model(xt,u[:,t],yt)                                    # Predict the next step, x(t+1), y(t+1)
+                loss += loss_fn(yt,y[:,t+1])                                    # Compute error between predicted y(t+1) and truth
+            loss.backward()                                                     # Backwards step
+            optimizer.step()                                                    # Optimize the parameters
+            prog_bar.set_description(f'loss: {loss.item():.3f}')                # Report the loss on the progress bar
+            step_losses.append(loss.item())                                     # Save the loss for this batch
+        losses.append(np.mean(step_losses))                                     # Average the loss over all batches and save
+
+    plt.plot(losses,color='purple',linestyle='--',label='Total')                # Plot loss, should see convergence
+    plt.ylabel('Loss')
+    plt.xlabel('Epochs')
+    plt.ylim(0)
+    plt.xlim(0,len(losses)-1)
+    plt.legend()
+    print('Final Loss:',losses[-1])
+    return model, losses
+
+
+def model_prediction_torch(model, output, input, t, ts, plot=True, xlim=None, ylim=None):
+    # Compare the one step prediction to the LDS prediction
+    '''
+    Parameters---
+        model : PyTorch fitted latent dynamics model
+        ouput : L x N (L is number of time points and N the features)
+        input : L x M (L is number of time points and M the number of inputs)
+        t : L x 1 time array
+        ts : Time step in seconds
+        plot : Boolean for whether to generate the plot
+        xlim : Horizontal limits for the plot, as list
+        ylim : Plot vertical limits, can be set automatically
+    Return---
+        YTRUE : Same as output
+        YPRED : One step prediction from dynamics model
+        YSIM : multi-step prediction from LDS using model parameters
+        A, B, C, K : state matrix, input matrix, output matrix, forward matrix
+    '''
+    model.eval()
+    A = model.A.weight.detach().numpy()                                         # Extract the state matrix         
+    B = model.B.weight.detach().numpy()                                         # Extract the input matrix
+    C = model.C.weight.detach().numpy()                                         # Extract the observation matrix
+    K = model.K.weight.detach().numpy()                                         # Extract the forward matrix
+
+    output = torch.tensor(output.astype('float32'))
+    input = torch.tensor(input.astype('float32'))
+
+    YTRUE = output.numpy()
+    XTRUE = torch.tensor((np.linalg.pinv(C)@YTRUE.T).T.astype('float32'))       # Compute naively the "true" latent states
+
+    # Model Prediction
+    XPRED, YPRED = model(XTRUE,input,output)                                    # Make the one step prediction for each point
+    XPRED, YPRED = XPRED.detach().numpy(), YPRED.detach().numpy()
+
+    # LDS Prediction
+    if xlim == None:
+        xlim = [t[0],t[-1]]
+    t1, t2 = lfp.t_i(xlim[0],t,ts), lfp.t_i(xlim[1],t,ts)                       # Define indices to simulate over
+    xi = XTRUE[t1].numpy()                                                      # Take first 'true' latent state
+    yi = YTRUE[t1]                                                              # Take first true observation
+    sim_time = len(t[t1:t2])                                                    # Simulation time in # of points
+
+    YSIM = [] # Will be shifted one time up (like YPRED)
+    for i in range(sim_time+1):                                                 # For loop will use predicted values to predict next
+        xi = A@xi + B@input[t1+i].numpy() + K@yi                                # Compute predicted x(t+1)
+        yi = C@xi                                                               # Compute predicted y(t+1)
+        YSIM.append(yi)                                                         # Save predicted observation y(t+1)
+    YSIM = np.array(YSIM)
+    
+    if plot:
+        if ylim == None:
+            ylim = [np.min(YTRUE[t1:t2])-1,np.max(YTRUE[t1:t2])+1]
+
+        fig = plt.figure(figsize=(12,6))
+        plt.subplot(2,1,1)
+        truth = plt.plot(t[t1:t2],YTRUE[t1:t2],color='gray')
+        reg = plt.plot(t[t1:t2],YPRED[t1:t2],':k')
+        plt.xlim(xlim)
+        plt.ylim(ylim)
+        plt.ylabel('Bandpower')
+        plt.title('Predictions')
+        plt.legend([truth[0],reg[0]],['Truth','Model'])
+
+        plt.subplot(2,1,2)
+        truth = plt.plot(t[t1:t2],YTRUE[t1:t2],color='gray')
+        lds = plt.plot(t[t1:t2],YSIM[:-1],'--k')
+        plt.xlim(xlim)
+        plt.ylim(ylim)
+        plt.xlabel('Time (s)')
+        plt.ylabel('Bandpower')
+        plt.legend([truth[0],lds[0]],['Truth','LDS'])
+
+        fig.align_ylabels()
+
+    return YTRUE, YPRED, YSIM, A, B, C, K
